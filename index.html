@@ -194,13 +194,11 @@
       <section class="viewport">
         <canvas id="canvas"></canvas>
         <div class="view-controls">
-          <select id="projection" title="Projection">
-            <option value="isometric">Isometric</option>
-            <option value="top">Top-down</option>
-          </select>
-          <select id="spriteset" title="Sprite style">
-            <option value="isometric">Painted</option>
-            <option value="classic">Classic</option>
+          <select id="view" title="View angle">
+            <option value="isometric|isometric">Isometric</option>
+            <option value="isometric|classic">Steep isometric</option>
+            <option value="top|isometric">Top-down</option>
+            <option value="top|classic">Steep top-down</option>
           </select>
           <button id="rot-left" title="Rotate view (Q)">&#x21BA;</button>
           <button id="rot-right" title="Rotate view (E)">&#x21BB;</button>

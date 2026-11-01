@@ -276,11 +276,11 @@ async function main(): Promise<void> {
   writeForm();
 
   // ---------- view controls ----------
-  const projSel = $<HTMLSelectElement>('#projection');
-  const setSel = $<HTMLSelectElement>('#spriteset');
-  const onProj = () => renderer.setProjection(projSel.value as Projection, setSel.value as SpriteSet);
-  projSel.addEventListener('change', onProj);
-  setSel.addEventListener('change', onProj);
+  const viewSel = $<HTMLSelectElement>('#view');
+  viewSel.addEventListener('change', () => {
+    const [projection, spriteSet] = viewSel.value.split('|') as [Projection, SpriteSet];
+    renderer.setProjection(projection, spriteSet);
+  });
   $('#rot-left').addEventListener('click', () => renderer.setRotation(renderer.rotation + 3));
   $('#rot-right').addEventListener('click', () => renderer.setRotation(renderer.rotation + 1));
   const zoomCenter = (factor: number) => {
