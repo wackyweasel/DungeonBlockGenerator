@@ -194,7 +194,7 @@ for (const pack of packs) {
       mainWall.f.pieces.push(...w.f.pieces.map((p) => ({ ...p, suffix: p.suffix || w.key || 'variant' })));
       continue;
     }
-    if (w !== mainWall && mainWall && !ownGround && Math.abs(w.h - mainWall.h) <= 1 && w.model === mainWall.model && !(ov.keepFamilies ?? []).includes(w.key) && ov.style !== 'wilds') {
+    if (w !== mainWall && mainWall && !ownGround && Math.abs(w.h - mainWall.h) <= 1 && w.model === mainWall.model && !(ov.keepFamilies ?? []).includes(w.key) && ov.style !== 'wilds' && ov.style !== 'colossal') {
       mainWall.f.pieces.push(...w.f.pieces.map((p) => ({ ...p, suffix: p.suffix || w.key || 'variant' })));
       continue;
     }
@@ -412,7 +412,38 @@ export interface Pc { c: string; w: number; m: number[] }
 export interface WallFam { key: string; model: 'edge' | 'link'; h: number; ground: string | null; base: Pc[]; decor: Pc[]; torch: Pc[]; doors: Pc[] }
 export interface EdgeFam { key: string; liquid: boolean; full: W[]; pieces: Pc[]; decor: string[] }
 export interface LinkFam { key: string; liquid: boolean; pieces: Pc[] }
-export type SetStyle = 'dungeon' | 'cave' | 'wilds' | 'town' | 'swamp' | 'ship';
+export type SetStyle = 'dungeon' | 'cave' | 'wilds' | 'town' | 'swamp' | 'ship' | 'colossal';
+/** Colossal style: curated pieces. Lists by height class are indexed 0-2 = +3/+6/+9 (low/medium/tall). */
+export interface Colossal {
+  supports: string[];
+  /** wall family keys by height class */
+  walls: string[];
+  /** wall variants (codes taken from the wall families' pieces) */
+  styles?: Record<string, string[]>;
+  doors?: string[];
+  giant?: string[];
+  bigStairs?: string[][];
+  stairs?: string[][];
+  stairAngles?: string[];
+  columns?: string[];
+  caps?: string[];
+  brokenColumns?: string[];
+  pedestals?: string[];
+  pits?: string[];
+  statues?: string[];
+  ruinedStatues?: string[];
+  guardians?: string[];
+  thrones?: string[];
+  coffins?: string[];
+  gold?: string[];
+  fires?: string[];
+  wells?: string[];
+  rubble?: string[];
+  /** floor palettes: space-separated codes */
+  floors?: string[];
+  grass?: string[];
+  grassDecor?: string[];
+}
 export interface SetDef {
   id: string;
   name: string;
@@ -442,6 +473,7 @@ export interface SetDef {
     swamp?: Record<string, string[]>;
     /** Wilds style: support blocks, cliff families and stairs by height step (+3, +6, +9). */
     elevation?: { supports: string[][]; classes: string[][]; stairs?: string[][] };
+    colossal?: Colossal;
   };
   fp: Record<string, number[]>;
 }

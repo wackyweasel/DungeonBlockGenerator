@@ -4,7 +4,7 @@ import { generate, DEFAULT_PARAMS } from '../js/generator.js';
 import { SETS } from '../js/sets.js';
 
 const [onlySet, onlyStyle] = process.argv.slice(2);
-const styles = onlyStyle ? [onlyStyle] : ['auto', 'dungeon', 'cave', 'wilds', 'town', 'swamp', 'ship'];
+const styles = onlyStyle ? [onlyStyle] : ['auto', 'dungeon', 'cave', 'wilds', 'town', 'swamp', 'ship', 'colossal'];
 let failures = 0;
 for (const set of SETS) {
   if (onlySet && set.id !== onlySet) continue;

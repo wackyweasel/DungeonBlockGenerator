@@ -49,7 +49,7 @@ async function main(): Promise<void> {
     const saved = localStorage.getItem(PARAMS_KEY);
     if (saved) params = { ...params, ...JSON.parse(saved) };
   } catch { /* ignore corrupt storage */ }
-  if (!['auto', 'dungeon', 'cave', 'wilds', 'town', 'swamp', 'ship'].includes(params.style)) params.style = 'auto';
+  if (!['auto', 'dungeon', 'cave', 'wilds', 'town', 'swamp', 'ship', 'colossal'].includes(params.style)) params.style = 'auto';
   if (!SETS.some((s) => s.id === params.theme)) params.theme = DEFAULT_PARAMS.theme;
 
   let initial = null;
@@ -229,12 +229,13 @@ async function main(): Promise<void> {
     const autoOpt = f('style').options[0];
     autoOpt.textContent = `Set default (${style})`;
     const show = (sel: string, on: boolean) => form.querySelectorAll<HTMLElement>(sel).forEach((e) => (e.style.display = on ? '' : 'none'));
-    show('.rooms-only', style === 'dungeon' || style === 'town' || style === 'swamp');
+    show('.rooms-only', style === 'dungeon' || style === 'town' || style === 'swamp' || style === 'colossal');
     show('.dungeon-only', style === 'dungeon');
-    show('.cavern-only', style === 'cave' || style === 'wilds' || style === 'swamp');
-    show('.wilds-only', style === 'wilds');
-    show('.paths-only', style !== 'dungeon' && style !== 'ship');
-    show('.room-count', style !== 'dungeon' || f('layout').value !== 'fill');
+    show('.cavern-only', style === 'cave' || style === 'wilds' || style === 'swamp' || style === 'colossal');
+    show('.wilds-only', style === 'wilds' || style === 'colossal');
+    show('.paths-only', style !== 'dungeon' && style !== 'ship' && style !== 'colossal');
+    show('.not-colossal', style !== 'colossal');
+    show('.room-count', style !== 'colossal' && (style !== 'dungeon' || f('layout').value !== 'fill'));
     (form.querySelector('.custom-size') as HTMLElement).style.display = f('sizePreset').value === 'custom' ? '' : 'none';
     (form.querySelector('.custom-rooms') as HTMLElement).style.display = f('roomSizePreset').value === 'custom' ? '' : 'none';
     form.querySelectorAll<HTMLElement>('.val').forEach((v) => {
@@ -260,7 +261,7 @@ async function main(): Promise<void> {
     renderer.fit();
     const tiles = res.design.levels.reduce((s, l) => s + l.tiles.length, 0);
     const short = res.style === 'dungeon' && params.layout === 'count' && res.rooms < params.roomCount ? ` of ${params.roomCount} (no space left: larger size or smaller rooms)` : '';
-    $('#gen-info').textContent = `${SETS.find((s) => s.id === params.theme)?.name ?? params.theme}, ${res.style}: ${res.rooms ? `${res.rooms}${short} ${res.style === 'dungeon' ? 'rooms' : 'buildings'}, ` : ''}${res.floorCells} cells, ${tiles} pieces (${Math.round(performance.now() - t0)} ms).`;
+    $('#gen-info').textContent = `${SETS.find((s) => s.id === params.theme)?.name ?? params.theme}, ${res.style}: ${res.rooms ? `${res.rooms}${short} ${res.style === 'dungeon' ? 'rooms' : res.style === 'colossal' ? 'halls' : 'buildings'}, ` : ''}${res.floorCells} cells, ${tiles} pieces (${Math.round(performance.now() - t0)} ms).`;
   };
   form.addEventListener('submit', (e) => {
     e.preventDefault();

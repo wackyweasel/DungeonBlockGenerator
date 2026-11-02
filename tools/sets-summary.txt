@@ -1,8 +1,8 @@
   (dropped edge family "dirt grass" without full tile)
   (dropped edge family "rock grass" without full tile)
-== CD "Colossal Dungeon (XL)" style=wilds scale=3 mainGround=""
+== CD "Colossal Dungeon (XL)" style=colossal scale=3 mainGround=""
   grounds: "dirt"[002,003] "grass"[027] ""[001]
-  wall "medium" edge h7 ground=- base[063,062,064,061] decor[065,067,178,068,177,176,175,066,165,167,166] torch[] doors[]
+  wall "medium" edge h7 ground=- base[063,062,064,061] decor[065,067,178,068,177,176,175,066] torch[] doors[]
   wall "low" edge h4 ground=- base[056,053,054,055] decor[170,171,174,172,173] torch[] doors[]
   wall "tall" edge h10 ground=- base[074,075,072,073] decor[181,179,077,085,079,081,076,082,187,183,184,180,084,185,186,083,182,080,078] torch[] doors[]
   edge "grass" full[027] pieces[034,028,030,031] decor[]
@@ -10,7 +10,6 @@
   scatter: 045 Dangerous Water 3, 043 Dangerous Water 1, 044 Dangerous Water 2, 046 Dangerous Water Monster Bones
   props: 010 Ground Borders Horns, 037 Grass Ruins
   trees: 036 Grass Tree
-  columns: 134 Top Column Key, 133 Column Broken, 131 Column, 132 Column Symbol, 135 Top Column Slot, 130 Column Base
   lights: 015 Fire 1, 014 Well Fire, 016 Fire 2
   furniture: 011 Throne
   hazards: 005 Ground Trap

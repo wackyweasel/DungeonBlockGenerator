@@ -1,6 +1,6 @@
 import { rotate } from './catalogue.js';
 import { Rng } from './rng.js';
-import { SETS, type EdgeFam, type LinkFam, type Pc, type SetDef, type SetStyle, type W } from './sets.js';
+import { SETS, type Colossal, type EdgeFam, type LinkFam, type Pc, type SetDef, type SetStyle, type W } from './sets.js';
 import type { DbbDesign, DbbTile } from './types.js';
 
 export type Shape = 'rectangle' | 'ellipse' | 'diamond' | 'cross' | 'lshape' | 'ring' | 'organic';
@@ -73,7 +73,8 @@ export interface GenResult {
 
 export function resolveStyle(p: Pick<GenParams, 'theme' | 'style'>): SetStyle {
   const set = SETS.find((s) => s.id === p.theme) ?? SETS[0];
-  return p.style === 'auto' ? set.style : p.style;
+  const style = p.style === 'auto' ? set.style : p.style;
+  return style === 'colossal' && !set.opts.colossal ? 'dungeon' : style;
 }
 
 // Sides: 0=W 1=N 2=E 3=S. Corners (mask bits 4-7): NW NE SE SW; corner k touches sides k and k+1.
@@ -101,6 +102,20 @@ interface Room {
   shape: string;
   kind: RoomKind;
   alive: boolean;
+}
+
+interface CRegion {
+  id: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  cells: number[];
+  hall: number;
+  hs: number;
+  kind: string;
+  style: string;
+  floor: string[];
 }
 
 interface Door {
@@ -315,6 +330,12 @@ class Generator {
   private stairsAt: number[] = [];
   private keep = new Uint8Array(0); // swamp: cells kept free of big decor (around buildings and trails)
   private trail = new Uint8Array(0); // swamp: plank trail cells
+  // colossal style
+  private cReg = new Int16Array(0); // region of every macro cell (-1: void)
+  private cRegions: CRegion[] = [];
+  private cSide = new Uint8Array(0); // wall height class (1-3) per cell side (cell * 4 + side)
+  private cStairs = new Map<number, { s: number; code: string }>(); // stairs climbing toward side s
+  private cRuns: [number, number, number][][] = []; // grand staircases: [low cell, side, high cell]
 
   // per macro cell
   readonly reg: Int16Array; // walled region (-1: no walls)
@@ -355,6 +376,11 @@ class Generator {
 
   run(): void {
     makeMask(this.g, this.p.shape, this.rng);
+    if (this.style === 'colossal') {
+      this.layoutColossal();
+      this.tileColossal();
+      return;
+    }
     switch (this.style) {
       case 'cave': this.layoutCave(); break;
       case 'wilds': this.layoutWilds(); break;
@@ -1595,6 +1621,695 @@ class Generator {
     };
     raise(cabin, cabin[1], 2, cabin[1] + 1);
     if (hold) raise(hold, hold[0], 0, hold[0] - 1);
+  }
+
+  // ----- colossal style ------------------------------------------------------------------------
+
+  /**
+   * Multi-level halls. The area is split (BSP) into rectangular regions that are grouped into halls; every region has a
+   * height step (0-3) and stands on support blocks. Regions of one hall are terraces joined by grand staircases, halls are
+   * joined by doorways (same height) or stairs. Walls rise toward the void (tall at the back, low at the front so the
+   * interior stays visible) and between halls of the same height; drops toward lower regions are open ledges.
+   */
+  private layoutColossal(): void {
+    const { g, p, rng } = this;
+    const { W, H } = g;
+    const N = W * H;
+    const e = p.elevation;
+    const maxS = Math.min(8, Math.max(3, Math.round(p.roomMax * 0.75)));
+    const minS = Math.max(2, Math.min(maxS - 1, Math.round(p.roomMin * 0.6)));
+    const leaves: [number, number, number, number][] = [];
+    const split = (x: number, y: number, w: number, h: number): void => {
+      const canX = w >= 2 * minS;
+      const canY = h >= 2 * minS;
+      if ((canX || canY) && (w > maxS || h > maxS || (w * h >= 2 * minS * minS && rng.chance(0.2)))) {
+        if (canX && (!canY || w > h || (w === h && rng.chance(0.5)))) {
+          const c = rng.int(minS, w - minS);
+          split(x, y, c, h);
+          split(x + c, y, w - c, h);
+        } else {
+          const c = rng.int(minS, h - minS);
+          split(x, y, w, c);
+          split(x, y + c, w, h - c);
+        }
+        return;
+      }
+      leaves.push([x, y, w, h]);
+    };
+    split(0, 0, W, H);
+
+    const reg = new Int16Array(N).fill(-1);
+    let regions: CRegion[] = [];
+    const maskArea = g.mask.reduce((s, v) => s + v, 0);
+    for (let attempt = 0; attempt < 5; attempt++) {
+      reg.fill(-1);
+      regions = [];
+      for (const [x, y, w, h] of leaves) {
+        const cells: number[] = [];
+        for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) if (g.mask[g.idx(x + i, y + j)]) cells.push(g.idx(x + i, y + j));
+        if (cells.length < 2) continue;
+        const border = x === 0 || y === 0 || x + w === W || y + h === H;
+        if (attempt < 4 && leaves.length > 4 && w * h <= 16 && rng.chance(border ? 0.14 : 0.03)) continue;
+        for (const k of cells) reg[k] = regions.length;
+        regions.push({ id: regions.length, x, y, w, h, cells, hall: -1, hs: 0, kind: 'plain', style: 'plain', floor: [] });
+      }
+      // keep the largest connected group of regions
+      const seen = new Uint8Array(N);
+      let bestComp: number[] = [];
+      for (let i = 0; i < N; i++) {
+        if (reg[i] < 0 || seen[i]) continue;
+        const comp = flood(g, i, seen, (k) => reg[k] >= 0);
+        if (comp.length > bestComp.length) bestComp = comp;
+      }
+      const keepCell = new Uint8Array(N);
+      for (const k of bestComp) keepCell[k] = 1;
+      for (let i = 0; i < N; i++) if (!keepCell[i]) reg[i] = -1;
+      if (bestComp.length >= maskArea * 0.82 || attempt === 4) break;
+    }
+    const live = regions.filter((r) => reg[r.cells[0]] === r.id);
+    // region adjacency (shared boundary length)
+    const adj = new Map<number, Map<number, number>>();
+    for (const r of live) adj.set(r.id, new Map());
+    const pairs = new Map<string, [number, number, number][]>(); // "a,b" (a < b) -> [cell of a, cell of b, side from a]
+    for (let k = 0; k < N; k++) {
+      if (reg[k] < 0) continue;
+      const [x, y] = this.xy(k);
+      for (let d = 0; d < 4; d++) {
+        const nx = x + DX[d];
+        const ny = y + DY[d];
+        if (!g.in(nx, ny)) continue;
+        const n = g.idx(nx, ny);
+        if (reg[n] < 0 || reg[n] === reg[k]) continue;
+        const m = adj.get(reg[k])!;
+        m.set(reg[n], (m.get(reg[n]) ?? 0) + 1);
+        if (reg[k] < reg[n]) {
+          const key = `${reg[k]},${reg[n]}`;
+          if (!pairs.has(key)) pairs.set(key, []);
+          pairs.get(key)!.push([k, n, d]);
+        }
+      }
+    }
+
+    // halls of 1-3 regions: terraces at different heights
+    const halls: number[][] = [];
+    const pT = e <= 0 ? 0 : 0.3 + 0.45 * e;
+    for (const r0 of rng.shuffle(live.map((r) => r.id))) {
+      if (regions[r0].hall >= 0) continue;
+      const hall = [r0];
+      regions[r0].hall = halls.length;
+      halls.push(hall);
+      for (let chance = pT; hall.length < 3 && rng.chance(chance); chance *= 0.6) {
+        const cands = hall.flatMap((q) => [...adj.get(q)!].filter(([n, len]) => regions[n].hall < 0 && len >= 2).map(([n]) => n));
+        if (!cands.length) break;
+        const n = rng.pick(cands);
+        regions[n].hall = regions[r0].hall;
+        hall.push(n);
+      }
+    }
+    // heights and connections; rerolled when some terrace cannot be reached (thin regions or too high drops)
+    for (let attempt = 0; ; attempt++) {
+      this.doors.clear();
+      this.cStairs.clear();
+      this.cRuns = [];
+      // heights: a walk over the regions so every region is within stair reach (3 steps) of the one it was reached from;
+      // terraces of one hall always differ from each other, neighbouring halls often step up or down
+      const maxH = e <= 0 || attempt >= 7 ? 0 : Math.round(Math.min(9, 2 + e * 10) / (attempt >= 5 ? 2 : 1));
+      const hsOf = new Int8Array(regions.length).fill(-1);
+      const tilt = rng.next() * 0.6;
+      const tgt = (r: number) => {
+        const q = regions[r];
+        const fx = (q.x + q.w / 2) / W;
+        const fy = (q.y + q.h / 2) / H;
+        return maxH * (1.15 - (fx + fy) * (0.55 + tilt * 0.5)) ;
+      };
+      const start = live.reduce((a, b) => (b.x + b.w + b.y + b.h > a.x + a.w + a.y + a.h ? b : a));
+      hsOf[start.id] = 0;
+      const queue = [start.id];
+      while (queue.length) {
+        const r = queue.splice(rng.int(0, Math.min(2, queue.length - 1)), 1)[0];
+        for (const [n] of rng.shuffle([...adj.get(r)!])) {
+          if (hsOf[n] >= 0) continue;
+          const same = regions[n].hall === regions[r].hall;
+          const taken = new Set([...adj.get(n)!.keys()].filter((q) => regions[q].hall === regions[n].hall && hsOf[q] >= 0).map((q) => hsOf[q]));
+          const opts: { v: number; w: number }[] = [];
+          for (let v = 0; v <= maxH; v++) {
+            const dd = Math.abs(v - hsOf[r]);
+            if (dd > (same ? 3 : 6) || taken.has(v)) continue;
+            let w = same ? [0, 1.5, 3, 1.5][dd] : [1 - 0.6 * e, 0.5, 1 + e, 0.8 + e, 0.4 + e, 0.3 + e, 0.2 + e][dd];
+            if (Math.abs(v - tgt(n)) < Math.abs(hsOf[r] - tgt(n))) w *= 1.8; // terraces rise toward the back of the map
+            else if (Math.abs(v - tgt(n)) > Math.abs(hsOf[r] - tgt(n))) w *= 0.55;
+            if (w > 0) opts.push({ v, w });
+          }
+          hsOf[n] = opts.length ? rng.weighted(opts) : hsOf[r];
+          queue.push(n);
+        }
+      }
+      const hs = new Uint8Array(N);
+      for (const r of live) {
+        r.hs = hsOf[r.id];
+        for (const k of r.cells) {
+          hs[k] = r.hs;
+          g.kind[k] = ROOM;
+          g.room[k] = r.hall;
+          this.reg[k] = r.hall;
+        }
+      }
+      this.hs = hs;
+      this.cReg = reg;
+      this.cRegions = regions;
+
+      // wall height class (1-3 = low/medium/tall) of every cell side; drops toward higher regions are recorded (for stairs)
+      // but stay open so the support blocks show the height difference
+      const side = new Uint8Array(N * 4);
+      const back = [3, 3, 3, 3, 3, 2, 2, 2, 2, 2];
+      const inner = [2, 2, 2, 2, 2, 1, 1, 1, 1, 1];
+      this.want = new Int16Array(N);
+      for (let k = 0; k < N; k++) {
+        if (reg[k] < 0) continue;
+        const [x, y] = this.xy(k);
+        const h = hs[k];
+        for (let d = 0; d < 4; d++) {
+          const nx = x + DX[d];
+          const ny = y + DY[d];
+          const n = g.in(nx, ny) ? g.idx(nx, ny) : -1;
+          let c = 0;
+          let wall = true;
+          if (n < 0 || reg[n] < 0) c = d <= 1 ? back[h] : 1;
+          else if (reg[n] === reg[k]) c = 0;
+          else if (hs[n] > h) {
+            c = hs[n] - h;
+            wall = false;
+          } else if (hs[n] === h && d <= 1 && regions[reg[n]].hall !== regions[reg[k]].hall) c = inner[h];
+          side[k * 4 + d] = c;
+          if (c && wall) this.want[k] |= 1 << d;
+        }
+      }
+      this.cSide = side;
+
+      // connections: grand staircases between the terraces of a hall, doorways and stairs between halls
+      this.keep = new Uint8Array(N);
+      const keep = this.keep;
+      const busy = (k: number) => this.doors.has(k) || this.cStairs.has(k) || this.used[k] === 1;
+      const rh = hs.slice(); // region floor heights (stair cells may be raised below)
+      const conn = (list: [number, number, number][], grand: boolean, force = false): boolean => {
+        const [k0, n0] = list[0];
+        if (Math.abs(rh[k0] - rh[n0]) > 6) return false;
+        if (rh[k0] === rh[n0] && list.some(([k, n, d]) => !side[k * 4 + d] && !side[n * 4 + ((d + 2) % 4)])) return true;
+        if (rh[k0] === rh[n0]) {
+          const c: [number, number, number][] = [];
+          for (const [k, n, d] of list) {
+            const o = side[k * 4 + d] ? k : n;
+            const s = o === k ? d : (d + 2) % 4;
+            const q = o === k ? n : k;
+            if (side[o * 4 + s] && (force || this.want[o] === 1 << s) && !busy(o) && !busy(q)) c.push([o, s, q]);
+          }
+          if (!c.length) return false;
+          if (force) {
+            // archway: just open the wall
+            const [o, s, q] = rng.pick(c);
+            this.want[o] &= ~(1 << s);
+            side[o * 4 + s] = 0;
+            keep[o] = keep[q] = 1;
+            return true;
+          }
+          const [o, s, q] = c[Math.min(c.length - 1, Math.max(0, Math.floor(c.length / 2) + rng.int(-1, 1)))];
+          this.doors.set(o, { cell: o, dir: s, part: 'single' });
+          keep[o] = keep[q] = 1;
+          return true;
+        }
+        const cfg = this.set.opts.colossal!;
+        const big = grand || rng.chance(0.65);
+        const pickStair = (drop: number) => {
+          const l2 = (big ? cfg.bigStairs : cfg.stairs)?.[drop - 1]?.filter((x) => this.fits(x)) ?? [];
+          return l2.length ? rng.weighted(l2.map((v) => ({ v, w: v === 'CD-109' ? 0.4 : 1 }))) : '';
+        };
+        const tot = Math.abs(rh[k0] - rh[n0]);
+        const chain = (n: number) => {
+          // landing, n flights (later ones raised on supports) and the top, in a row straddling the boundary at any offset
+          const opts: [number, number[]][] = [];
+          for (const [k, n2, d] of list) {
+            const [l, s, u] = rh[k] < rh[n2] ? [k, d, n2] : [n2, (d + 2) % 4, k];
+            const [x, y] = this.xy(l);
+            for (let back = 0; back <= n; back++) {
+              const ch: number[] = [];
+              for (let i = 0; i < n + 2; i++) {
+                const t = i - back;
+                const cx = x + DX[s] * t;
+                const cy = y + DY[s] * t;
+                if (!g.in(cx, cy)) break;
+                const q = g.idx(cx, cy);
+                const home = t <= 0 ? l : u;
+                const end = i === 0 || i === n + 1;
+                const okReg = reg[q] === reg[home] || (force && end && reg[q] >= 0 && rh[q] === rh[home]);
+                if (!okReg || busy(q) || this.cStairs.has(q)) break;
+                if (!end && !force && this.want[q] !== 0) break;
+                ch.push(q);
+              }
+              if (ch.length === n + 2) opts.push([s, ch]);
+            }
+          }
+          if (!opts.length) return false;
+          const [s, ch] = opts[Math.min(opts.length - 1, Math.max(0, Math.floor(opts.length / 2) + rng.int(-1, 1)))];
+          const drops = n === 1 ? [tot] : [Math.ceil(tot / 2), tot - Math.ceil(tot / 2)];
+          const codes = drops.map(pickStair);
+          if (codes.some((x) => !x)) return false;
+          let h = Math.min(rh[k0], rh[n0]);
+          for (let i = 0; i < n; i++) {
+            const q = ch[i + 1];
+            hs[q] = h;
+            h += drops[i];
+            this.cStairs.set(q, { s, code: codes[i] });
+            this.want[q] = 0;
+          }
+          for (const q of ch) keep[q] = 1;
+          return true;
+        };
+        if (tot > 3) return chain(2);
+        const c: [number, number, number, number][] = []; // low cell, side toward the high one, high cell, front cell
+        for (const [k, n, d] of list) {
+          const [l, s, u] = rh[k] < rh[n] ? [k, d, n] : [n, (d + 2) % 4, k];
+          const [x, y] = this.xy(l);
+          const fx = x - DX[s];
+          const fy = y - DY[s];
+          if (!g.in(fx, fy)) continue;
+          const f = g.idx(fx, fy);
+          const sameFloor = force ? reg[f] >= 0 && rh[f] === rh[l] : reg[f] === reg[l];
+          if ((!force && this.want[l] !== 0) || busy(l) || busy(u) || busy(f) || !sameFloor || this.cStairs.has(f)) continue;
+          c.push([l, s, u, f]);
+        }
+        if (!c.length) return force && chain(1);
+        c.sort((a, b) => a[0] - b[0]);
+        const runs: (typeof c)[] = [];
+        for (const x of c) {
+          const last = runs[runs.length - 1]?.[runs[runs.length - 1].length - 1];
+          const [ax, ay] = last ? this.xy(last[0]) : [-9, -9];
+          const [bx, by] = this.xy(x[0]);
+          if (last && Math.abs(ax - bx) + Math.abs(ay - by) === 1) runs[runs.length - 1].push(x);
+          else runs.push([x]);
+        }
+        let run: typeof c;
+        if (grand) {
+          run = runs.sort((a, b) => b.length - a.length)[0];
+          if (run.length >= 5 && rng.chance(0.6)) run = run.slice(1, -1);
+        } else {
+          const all = runs.flat();
+          run = [all[Math.min(all.length - 1, Math.max(0, Math.floor(all.length / 2) + rng.int(-1, 1)))]];
+        }
+        const total = tot;
+        const code = pickStair(total);
+        if (!code) return false;
+        for (const [l, s, u, f] of run) {
+          this.cStairs.set(l, { s, code });
+          this.want[l] = 0;
+          keep[l] = keep[u] = keep[f] = 1;
+        }
+        if (grand && run.length >= 2) this.cRuns.push(run.map(([l, s, u]) => [l, s, u]));
+        return true;
+      };
+      const parent = live.map((r) => r.id);
+      const ids = new Map(live.map((r, i) => [r.id, i]));
+      const find = (r: number): number => {
+        let i = ids.get(r)!;
+        while (parent[i] !== live[i].id) i = ids.get(parent[i])!;
+        return live[i].id;
+      };
+      const union = (a: number, b: number) => {
+        parent[ids.get(find(a))!] = find(b);
+      };
+      const entries = rng.shuffle([...pairs.entries()]);
+      const linked = new Set<string>();
+      for (const [key, list] of entries) {
+        const [a, b] = key.split(',').map(Number);
+        if (regions[a].hall !== regions[b].hall) continue;
+        if (conn(list, true)) {
+          union(a, b);
+          linked.add(key);
+        }
+      }
+      for (const [key, list] of entries) {
+        const [a, b] = key.split(',').map(Number);
+        if (regions[a].hall === regions[b].hall || find(a) === find(b)) continue;
+        if (conn(list, false)) {
+          union(a, b);
+          linked.add(key);
+        }
+      }
+      for (const [key, list] of entries) {
+        const [a, b] = key.split(',').map(Number);
+        if (linked.has(key) || !rng.chance(p.loops * 0.6)) continue;
+        if (conn(list, regions[a].hall === regions[b].hall)) linked.add(key);
+      }
+      for (const [key, list] of entries) {
+        const [a, b] = key.split(',').map(Number);
+        if (find(a) !== find(b) && conn(list, false, true)) union(a, b);
+      }
+      const comps = new Set(live.map((r) => find(r.id))).size;
+      if (comps === 1 || attempt >= 7) {
+        break;
+      }
+    }
+    this.regionAll.push(...halls.map(() => true));
+    for (const hall of halls) {
+      const cells = hall.flatMap((r) => regions[r].cells);
+      const xs = cells.map((k) => k % W);
+      const ys = cells.map((k) => Math.floor(k / W));
+      const x = Math.min(...xs);
+      const y = Math.min(...ys);
+      const w = Math.max(...xs) - x + 1;
+      const h = Math.max(...ys) - y + 1;
+      this.rooms.push({ id: this.rooms.length, x, y, w, h, cells, cx: x + (w - 1) / 2, cy: y + (h - 1) / 2, shape: 'rect', kind: 'plain', alive: true });
+    }
+  }
+
+  // Places a piece at an explicit height (columns on top of their floor, supports, pits).
+  private placeAt(i: number, code: string, o: number, lvl: number, use = true): boolean {
+    const cv = this.cover(i, code, o);
+    if (!cv) return false;
+    if (use) for (const k of cv.cells) this.used[k] = 1;
+    this.layer(lvl).push({ x: cv.ax, y: cv.ay, element: code, orientation: o });
+    this.mark(cv, code, o);
+    return true;
+  }
+
+  private tileColossal(): void {
+    const cfg = this.set.opts.colossal!;
+    const { g, rng } = this;
+    const hs = this.hs!;
+    const N = g.W * g.H;
+    const reg = this.cReg;
+    const regions = this.cRegions;
+    const ok = (l?: string[]) => (l ?? []).filter((c) => this.fits(c));
+    const busy = (k: number) => this.doors.has(k) || this.cStairs.has(k);
+    const open = (k: number) => reg[k] >= 0 && this.want[k] === 0 && !this.used[k] && !this.keep[k] && !busy(k);
+    const noSupport = new Uint8Array(N);
+
+    // the look of every hall
+    const floors = (cfg.floors ?? []).map((f) => f.split(' ').filter((c) => this.fits(c))).filter((f) => f.length);
+    const hallLook = new Map<number, { style: string; floor: string[] }>();
+    for (const r of regions) {
+      if (reg[r.cells[0]] !== r.id) continue;
+      let look = hallLook.get(r.hall);
+      if (!look) {
+        const style = rng.weighted([{ v: 'plain', w: 4 }, { v: 'rock', w: 2 }, { v: 'ruins', w: 1.2 }, { v: 'columns', w: 2 }]);
+        const floor = floors.length ? rng.weighted(floors.map((v, i) => ({ v, w: i === 0 ? 5 : 2 }))) : [];
+        hallLook.set(r.hall, (look = { style, floor }));
+      }
+      r.style = look.style;
+      r.floor = look.floor;
+    }
+
+    this.colossalGiantEntrance(cfg);
+    this.colossalFeatures(cfg, open, noSupport);
+
+    // walls, doorways and stairs
+    const fam = cfg.walls.map((k) => this.famIndex(k));
+    const pools = new Map<string, Pc[]>();
+    const pool = (cls: number, style: string): Pc[] => {
+      const key = `${cls}:${style}`;
+      let pl = pools.get(key);
+      if (!pl) {
+        const f = this.set.walls[fam[cls - 1]];
+        const codes = cfg.styles?.[style];
+        pl = !f ? [] : codes ? [...f.base, ...f.decor].filter((pc) => codes.includes(pc.c)) : f.base;
+        pools.set(key, pl);
+      }
+      return pl;
+    };
+    const doors = ok(cfg.doors);
+    for (let k = 0; k < N; k++) {
+      if (reg[k] < 0 || this.used[k]) continue;
+      const st = this.cStairs.get(k);
+      if (st) {
+        this.put(k, st.code, (st.s + 3) % 4);
+        continue;
+      }
+      const door = this.doors.get(k);
+      if (door) {
+        if (this.cSide[k * 4 + door.dir] >= 2 && doors.length) this.put(k, rng.pick(doors), door.dir);
+        continue;
+      }
+      const want = this.want[k];
+      if (!want) continue;
+      let cls = 0;
+      for (let d = 0; d < 4; d++) if (want & (1 << d)) cls = Math.max(cls, this.cSide[k * 4 + d]);
+      const r = regions[reg[k]];
+      let style = r.style;
+      if (style === 'columns' && rng.chance(0.15)) style = 'columnRuins';
+      if (style === 'plain' && rng.chance(0.1)) style = rng.pick(['ruins', 'rock']);
+      let b = this.best(pool(cls, style), want);
+      if (!b.list.length || b.cost > 0) b = this.best(pool(cls, 'plain'), want);
+      if (!b.list.length) continue;
+      const c = this.pickCand(b.list);
+      this.put(k, c.c, c.o);
+    }
+
+    // support blocks under raised cells (stacked for the highest terraces)
+    const sup = cfg.supports;
+    for (let k = 0; k < N; k++) {
+      if (reg[k] < 0 || !hs[k]) continue;
+      for (let h = hs[k] - (noSupport[k] ? 2 : 0), z = 0; h > 0; ) {
+        const n = Math.min(h, sup.length);
+        if (!sup[n - 1]) break;
+        this.placeAt(k, sup[n - 1], 0, z, false);
+        h -= n;
+        z += n * 3;
+      }
+    }
+
+    // floors
+    for (let k = 0; k < N; k++) {
+      if (reg[k] < 0 || this.used[k]) continue;
+      const f = regions[reg[k]].floor;
+      const list = f.length ? f : (this.set.grounds[this.set.mainGround] ?? []).map((w) => w.v);
+      if (list.length) this.put(k, rng.pick(list), rng.int(0, 3));
+    }
+  }
+
+  // A giant gate in a tall back wall of a low hall.
+  private colossalGiantEntrance(cfg: Colossal): void {
+    const giant = (cfg.giant ?? []).filter((c) => (this.set.fp[c] ?? [1, 1])[1] === 2 * this.s);
+    if (!giant.length) return;
+    const { g, rng } = this;
+    const hs = this.hs!;
+    const reg = this.cReg;
+    const cands: [number, number, number][] = [];
+    for (let k = 0; k < g.W * g.H; k++) {
+      if (reg[k] < 0 || hs[k] > 1) continue;
+      for (const s of [0, 1]) {
+        if (this.want[k] !== 1 << s || this.cSide[k * 4 + s] < 3) continue;
+        const [x, y] = this.xy(k);
+        const [mx, my] = s === 0 ? [x, y + 1] : [x + 1, y];
+        if (!g.in(mx, my)) continue;
+        const m = g.idx(mx, my);
+        if (reg[m] !== reg[k] || this.want[m] !== 1 << s || this.cSide[m * 4 + s] < 3) continue;
+        if (this.doors.has(k) || this.doors.has(m) || this.cStairs.has(k) || this.cStairs.has(m)) continue;
+        cands.push([k, m, s]);
+      }
+    }
+    if (!cands.length) return;
+    const [k, m, s] = rng.pick(cands);
+    if (!this.put(k, rng.pick(giant), s)) return;
+    for (const c of [k, m]) {
+      const [x, y] = this.xy(c);
+      const fx = x - DX[s];
+      const fy = y - DY[s];
+      if (g.in(fx, fy)) this.keep[g.idx(fx, fy)] = 1;
+    }
+  }
+
+  private colossalFeatures(cfg: Colossal, open: (k: number) => boolean, noSupport: Uint8Array): void {
+    const { g, p, rng } = this;
+    const hs = this.hs!;
+    const reg = this.cReg;
+    const d = p.decor;
+    const ok = (l?: string[]) => (l ?? []).filter((c) => this.fits(c));
+    const floorOf = (k: number) => {
+      const f = this.cRegions[reg[k]].floor;
+      return f.length ? rng.pick(f) : (this.set.grounds[this.set.mainGround]?.[0]?.v ?? '');
+    };
+    const columns = ok(cfg.columns);
+    const caps = ok(cfg.caps);
+    const statues = ok(cfg.statues);
+    const ruined = ok(cfg.ruinedStatues);
+    const fires = ok(cfg.fires);
+    const wells = ok(cfg.wells);
+    const thrones = ok(cfg.thrones);
+    const coffins = ok(cfg.coffins);
+    const gold = ok(cfg.gold);
+    const pits = ok(cfg.pits);
+    const rubble = ok(cfg.rubble);
+    const grass = ok(cfg.grass);
+    const grassDecor = ok(cfg.grassDecor);
+    const guardians = ok(cfg.guardians);
+    const bigStairs = (cfg.bigStairs ?? []).map(ok);
+    const angles = ok(cfg.stairAngles);
+    const pedestals = ok(cfg.pedestals);
+    const broken = ok(cfg.brokenColumns);
+
+    // a column stands on its own floor tile
+    const column = (k: number, code: string, cap: boolean) => {
+      const f = floorOf(k);
+      if (!f || !this.put(k, f, rng.int(0, 3))) return;
+      this.placeAt(k, code, 0, hs[k] * 3 + 1, false);
+      if (cap && caps.length) this.placeAt(k, rng.pick(caps), 0, hs[k] * 3 + 10, false);
+    };
+
+    // stepped pyramid centred on c: rings of big stairs climbing toward the top cell
+    const pyramid = (c: number, levels: number, top: string[]) => {
+      const [cx, cy] = this.xy(c);
+      const base = hs[c];
+      for (let rr = levels; rr >= 1; rr--) {
+        for (let dy = -rr; dy <= rr; dy++) {
+          for (let dx = -rr; dx <= rr; dx++) {
+            if (Math.max(Math.abs(dx), Math.abs(dy)) !== rr) continue;
+            const k = g.idx(cx + dx, cy + dy);
+            hs[k] = base + levels - rr;
+            const corner = Math.abs(dx) === rr && Math.abs(dy) === rr;
+            if (corner) {
+              const ci = [0, 1, 2, 3].find((q) => CX[q] === -Math.sign(dx) && CY[q] === -Math.sign(dy))!;
+              if (angles[0]) this.put(k, angles[0], ci);
+            } else {
+              const s = Math.abs(dx) === rr ? (dx < 0 ? 2 : 0) : dy < 0 ? 3 : 1;
+              const st = bigStairs[0]?.[0];
+              if (st) this.put(k, st, (s + 3) % 4);
+            }
+          }
+        }
+      }
+      hs[c] = base + levels;
+      const t = top.length ? rng.pick(top) : '';
+      if (t) this.put(c, t, rng.pick([0, 1]));
+      else this.put(c, floorOf(c), 0);
+    };
+    const blockAt = (r: CRegion, c: number, rad: number) => {
+      const [cx, cy] = this.xy(c);
+      for (let dy = -rad; dy <= rad; dy++) {
+        for (let dx = -rad; dx <= rad; dx++) {
+          if (!g.in(cx + dx, cy + dy)) return false;
+          const k = g.idx(cx + dx, cy + dy);
+          if (reg[k] !== r.id || !open(k)) return false;
+        }
+      }
+      return true;
+    };
+    const centreBlock = (r: CRegion, rad: number): number => {
+      const mx = r.x + (r.w - 1) / 2;
+      const my = r.y + (r.h - 1) / 2;
+      let best = -1;
+      let bd = Infinity;
+      for (const k of r.cells) {
+        const [x, y] = this.xy(k);
+        const dd = Math.abs(x - mx) + Math.abs(y - my) + rng.next() * 0.5;
+        if (dd < bd && blockAt(r, k, rad)) {
+          bd = dd;
+          best = k;
+        }
+      }
+      return best;
+    };
+
+    // guardians on both sides of the top of grand staircases
+    for (const run of this.cRuns) {
+      if (!guardians.length || !rng.chance(0.3 + d * 0.5)) continue;
+      const [, s] = run[0];
+      const lat = [(s + 1) % 4, (s + 3) % 4];
+      const ends = [run[0][2], run[run.length - 1][2]];
+      const ups = new Set(run.map((x) => x[2]));
+      for (const u of ends) {
+        const [ux, uy] = this.xy(u);
+        for (const ld of lat) {
+          const nx = ux + DX[ld];
+          const ny = uy + DY[ld];
+          if (!g.in(nx, ny)) continue;
+          const n = g.idx(nx, ny);
+          if (ups.has(n) || reg[n] !== reg[u] || !open(n)) continue;
+          this.put(n, guardians[ld === lat[0] ? 0 : guardians.length - 1], (s + 2) % 4);
+        }
+      }
+    }
+
+    let thronePlaced = false;
+    const live = this.cRegions.filter((r) => reg[r.cells[0]] === r.id);
+    for (const r of rng.shuffle([...live])) {
+      const inner = r.cells.filter(open);
+      if (!inner.length) continue;
+      const big = r.w >= 4 && r.h >= 4;
+      const kinds: { v: string; w: number }[] = [
+        { v: 'plain', w: 1 },
+        { v: 'colonnade', w: big && columns.length ? 3 : 0 },
+        { v: 'ziggurat', w: r.w >= 5 && r.h >= 5 ? 3 : r.w >= 3 && r.h >= 3 ? 1 : 0 },
+        { v: 'throne', w: !thronePlaced && thrones.length && r.w >= 4 && r.h >= 4 ? 2 : 0 },
+        { v: 'crypt', w: coffins.length && inner.length >= 3 ? 1.2 : 0 },
+        { v: 'pits', w: pits.length && r.hs >= 2 && inner.length >= 3 ? 2.5 : 0 },
+        { v: 'atrium', w: grass.length && inner.length >= 4 ? 0.8 : 0 },
+        { v: 'shrine', w: fires.length + wells.length && inner.length >= 2 ? 1 : 0 },
+      ];
+      r.kind = rng.weighted(kinds.filter((x) => x.w > 0));
+      switch (r.kind) {
+        case 'ziggurat':
+        case 'throne': {
+          const two = r.kind === 'ziggurat' && r.hs <= 6 ? centreBlock(r, 2) : -1;
+          const c = two >= 0 ? two : centreBlock(r, 1);
+          if (c < 0) break;
+          if (r.kind === 'throne') thronePlaced = true;
+          pyramid(c, two >= 0 ? 2 : 1, r.kind === 'throne' ? thrones : [...statues, ...fires, ...statues]);
+          break;
+        }
+        case 'colonnade': {
+          const cap = rng.chance(0.5);
+          const code = rng.pick(columns);
+          for (const k of r.cells) {
+            const [x, y] = this.xy(k);
+            if ((x - r.x) % 2 === 1 && (y - r.y) % 2 === 1 && open(k)) {
+              if (broken.length && rng.chance(0.12)) column(k, rng.pick(broken), false);
+              else column(k, code, cap);
+            }
+          }
+          break;
+        }
+        case 'crypt': {
+          const o = rng.int(0, 3);
+          let goldLeft = gold.length ? 1 : 0;
+          for (const k of r.cells) {
+            const [x, y] = this.xy(k);
+            if (!open(k) || (o % 2 === 0 ? (x - r.x) % 2 : (y - r.y) % 2) !== 1 || !rng.chance(0.85)) continue;
+            this.put(k, goldLeft-- > 0 && rng.chance(0.4) ? gold[0] : rng.pick(coffins), o);
+          }
+          break;
+        }
+        case 'pits':
+          for (const k of rng.shuffle([...inner])) {
+            if (!open(k) || !rng.chance(0.45)) continue;
+            if (this.neighbours8(k, (n) => noSupport[n] === 1) > 1) continue;
+            noSupport[k] = 1;
+            this.placeAt(k, rng.pick(pits), rng.int(0, 3), (hs[k] - 2) * 3);
+          }
+          break;
+        case 'atrium':
+          for (const k of inner) {
+            if (!open(k)) continue;
+            if (grassDecor.length && rng.chance(0.3 + d * 0.3)) this.put(k, rng.pick(grassDecor), rng.int(0, 3));
+            else this.put(k, rng.pick(grass), rng.int(0, 3));
+          }
+          break;
+        case 'shrine': {
+          const c = centreBlock(r, 0);
+          if (c >= 0) this.put(c, rng.pick([...fires, ...wells, ...pedestals]), rng.int(0, 3));
+          break;
+        }
+      }
+      // statues watch over the corners of large halls
+      if (big && statues.length && (r.kind === 'plain' || r.kind === 'colonnade' || r.kind === 'throne')) {
+        for (const [x, y] of [[r.x + 1, r.y + 1], [r.x + r.w - 2, r.y + 1], [r.x + 1, r.y + r.h - 2], [r.x + r.w - 2, r.y + r.h - 2]]) {
+          if (g.in(x, y) && reg[g.idx(x, y)] === r.id && open(g.idx(x, y)) && rng.chance(0.25 + d * 0.4)) this.put(g.idx(x, y), rng.pick(rng.chance(0.2) && ruined.length ? ruined : statues), rng.int(0, 3));
+        }
+      }
+      for (const k of r.cells) {
+        if (!open(k)) continue;
+        if (rubble.length && rng.chance(d * 0.16)) this.put(k, rng.pick(rubble), rng.int(0, 3));
+        else if (fires.length && rng.chance(d * 0.03)) this.put(k, rng.pick(fires), rng.int(0, 3));
+      }
+    }
   }
 
   // ----- walls ---------------------------------------------------------------------------------
